@@ -2,6 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { WebSocketServer } = require("ws");
 
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_PIN = process.env.ADMIN_PIN || "1234";
@@ -9,6 +10,7 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || crypto.randomBytes(24).toString("
 const DATA_FILE = path.join(__dirname, "data.json");
 
 let state = loadState();
+const deviceSockets = new Map();
 
 function loadState() {
   try {
@@ -126,6 +128,7 @@ function createCommand(deviceId, type) {
   if (!state.commands[deviceId]) state.commands[deviceId] = [];
   state.commands[deviceId].push(command);
   saveState();
+  pushPendingCommands(deviceId);
   return command;
 }
 
@@ -136,15 +139,27 @@ function queueDesiredStateCommands(deviceId) {
   if (device.desiredProtected && !device.isUninstallBlocked) {
     createCommand(deviceId, "PROTECT");
   }
-  if (!device.desiredProtected && device.isUninstallBlocked) {
-    createCommand(deviceId, "DISABLE");
-  }
   if (device.desiredLocked && !device.isEmiLocked) {
     createCommand(deviceId, "LOCK");
   }
   if (!device.desiredLocked && device.isEmiLocked) {
     createCommand(deviceId, "UNLOCK");
   }
+}
+
+function pendingCommands(deviceId) {
+  if (!state.commands[deviceId]) state.commands[deviceId] = [];
+  queueDesiredStateCommands(deviceId);
+  return state.commands[deviceId].filter(command => command.status === "pending");
+}
+
+function pushPendingCommands(deviceId) {
+  const socket = deviceSockets.get(deviceId);
+  if (!socket || socket.readyState !== 1) return;
+  const commands = pendingCommands(deviceId);
+  commands.forEach(command => {
+    socket.send(JSON.stringify({ type: "command", command }));
+  });
 }
 
 async function route(req, res) {
@@ -189,7 +204,7 @@ async function route(req, res) {
       state.devices[deviceId].lastCommandError = "";
     }
     if (type === "DISABLE") {
-      state.devices[deviceId].desiredProtected = false;
+      state.devices[deviceId].desiredLocked = false;
       state.devices[deviceId].lastCommandError = "";
     }
     if (type === "LOCK") {
@@ -231,10 +246,7 @@ async function route(req, res) {
     parts[4] === "pending"
   ) {
     const deviceId = decodeURIComponent(parts[2]);
-    if (!state.commands[deviceId]) state.commands[deviceId] = [];
-    queueDesiredStateCommands(deviceId);
-    const commands = state.commands[deviceId].filter(command => command.status === "pending");
-    return send(res, 200, { commands });
+    return send(res, 200, { commands: pendingCommands(deviceId) });
   }
 
   if (
@@ -271,8 +283,64 @@ const server = http.createServer((req, res) => {
   route(req, res).catch(error => send(res, 500, { error: error.message }));
 });
 
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+wss.on("connection", (socket, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const deviceId = url.searchParams.get("deviceId");
+
+  if (!deviceId) {
+    socket.close(1008, "deviceId is required");
+    return;
+  }
+
+  deviceSockets.set(deviceId, socket);
+  socket.send(JSON.stringify({ type: "connected", deviceId, time: now() }));
+  pushPendingCommands(deviceId);
+
+  socket.on("message", message => {
+    let payload;
+    try {
+      payload = JSON.parse(String(message));
+    } catch (_) {
+      socket.send(JSON.stringify({ type: "error", error: "Invalid JSON" }));
+      return;
+    }
+
+    if (payload.type === "status") {
+      upsertDevice(deviceId, payload.status || {});
+      pushPendingCommands(deviceId);
+      return;
+    }
+
+    if (payload.type === "ack") {
+      const commandId = payload.commandId;
+      const commands = state.commands[deviceId] || [];
+      const command = commands.find(item => item.id === commandId);
+      if (!command) return;
+      command.status = payload.status === "failed" ? "failed" : "completed";
+      command.error = payload.error || "";
+      command.completedAt = now();
+      if (state.devices[deviceId]) {
+        state.devices[deviceId].lastCommandStatus = `${command.type}: ${command.status}`;
+        state.devices[deviceId].lastCommandError = command.error;
+        state.devices[deviceId].lastSeenAt = now();
+      }
+      saveState();
+      pushPendingCommands(deviceId);
+    }
+  });
+
+  socket.on("close", () => {
+    if (deviceSockets.get(deviceId) === socket) {
+      deviceSockets.delete(deviceId);
+    }
+  });
+});
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`RCA backend listening on http://0.0.0.0:${PORT}`);
+  console.log(`RCA websocket listening on ws://0.0.0.0:${PORT}/ws?deviceId=<id>`);
   console.log(`Admin PIN: ${ADMIN_PIN}`);
   console.log(`Admin token for this run: ${ADMIN_TOKEN}`);
 });
