@@ -81,6 +81,8 @@ function upsertDevice(deviceId, patch) {
     isDeviceOwner: Boolean(patch.isDeviceOwner ?? existing.isDeviceOwner),
     isUninstallBlocked: Boolean(patch.isUninstallBlocked ?? existing.isUninstallBlocked),
     isEmiLocked: Boolean(patch.isEmiLocked ?? existing.isEmiLocked),
+    lastCommandStatus: existing.lastCommandStatus || "",
+    lastCommandError: existing.lastCommandError || "",
     lastSeenAt: now()
   };
   if (!state.commands[deviceId]) state.commands[deviceId] = [];
@@ -97,6 +99,8 @@ function publicDevice(device) {
     isDeviceOwner: device.isDeviceOwner,
     isUninstallBlocked: device.isUninstallBlocked,
     isEmiLocked: device.isEmiLocked,
+    lastCommandStatus: device.lastCommandStatus || "",
+    lastCommandError: device.lastCommandError || "",
     lastSeenAt: device.lastSeenAt
   };
 }
@@ -198,11 +202,18 @@ async function route(req, res) {
   ) {
     const deviceId = decodeURIComponent(parts[2]);
     const commandId = decodeURIComponent(parts[4]);
+    const body = await readJson(req);
     const commands = state.commands[deviceId] || [];
     const command = commands.find(item => item.id === commandId);
     if (!command) return send(res, 404, { error: "Command not found" });
-    command.status = "completed";
+    command.status = body.status === "failed" ? "failed" : "completed";
+    command.error = body.error || "";
     command.completedAt = now();
+    if (state.devices[deviceId]) {
+      state.devices[deviceId].lastCommandStatus = `${command.type}: ${command.status}`;
+      state.devices[deviceId].lastCommandError = command.error;
+      state.devices[deviceId].lastSeenAt = now();
+    }
     saveState();
     return send(res, 200, { command });
   }
