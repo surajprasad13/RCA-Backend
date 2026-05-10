@@ -1,0 +1,13 @@
+{
+  "name": "rca-device-control-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local RCA demo backend for admin/device command flow",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
