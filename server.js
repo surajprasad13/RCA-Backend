@@ -73,14 +73,18 @@ function now() {
 
 function upsertDevice(deviceId, patch) {
   const existing = state.devices[deviceId] || {};
+  const isUninstallBlocked = Boolean(patch.isUninstallBlocked ?? existing.isUninstallBlocked);
+  const isEmiLocked = Boolean(patch.isEmiLocked ?? existing.isEmiLocked);
   state.devices[deviceId] = {
     id: deviceId,
     name: patch.name || existing.name || deviceId,
     role: patch.role || existing.role || "user",
     isAdminActive: Boolean(patch.isAdminActive ?? existing.isAdminActive),
     isDeviceOwner: Boolean(patch.isDeviceOwner ?? existing.isDeviceOwner),
-    isUninstallBlocked: Boolean(patch.isUninstallBlocked ?? existing.isUninstallBlocked),
-    isEmiLocked: Boolean(patch.isEmiLocked ?? existing.isEmiLocked),
+    isUninstallBlocked,
+    isEmiLocked,
+    desiredProtected: Boolean(existing.desiredProtected ?? isUninstallBlocked),
+    desiredLocked: Boolean(existing.desiredLocked ?? isEmiLocked),
     lastCommandStatus: existing.lastCommandStatus || "",
     lastCommandError: existing.lastCommandError || "",
     lastSeenAt: now()
@@ -99,6 +103,8 @@ function publicDevice(device) {
     isDeviceOwner: device.isDeviceOwner,
     isUninstallBlocked: device.isUninstallBlocked,
     isEmiLocked: device.isEmiLocked,
+    desiredProtected: Boolean(device.desiredProtected),
+    desiredLocked: Boolean(device.desiredLocked),
     lastCommandStatus: device.lastCommandStatus || "",
     lastCommandError: device.lastCommandError || "",
     lastSeenAt: device.lastSeenAt
@@ -106,6 +112,10 @@ function publicDevice(device) {
 }
 
 function createCommand(deviceId, type) {
+  const existing = state.commands[deviceId] || [];
+  const alreadyPending = existing.find(command => command.type === type && command.status === "pending");
+  if (alreadyPending) return alreadyPending;
+
   const command = {
     id: crypto.randomUUID(),
     type,
@@ -117,6 +127,24 @@ function createCommand(deviceId, type) {
   state.commands[deviceId].push(command);
   saveState();
   return command;
+}
+
+function queueDesiredStateCommands(deviceId) {
+  const device = state.devices[deviceId];
+  if (!device) return;
+
+  if (device.desiredProtected && !device.isUninstallBlocked) {
+    createCommand(deviceId, "PROTECT");
+  }
+  if (!device.desiredProtected && device.isUninstallBlocked) {
+    createCommand(deviceId, "DISABLE");
+  }
+  if (device.desiredLocked && !device.isEmiLocked) {
+    createCommand(deviceId, "LOCK");
+  }
+  if (!device.desiredLocked && device.isEmiLocked) {
+    createCommand(deviceId, "UNLOCK");
+  }
 }
 
 async function route(req, res) {
@@ -156,6 +184,22 @@ async function route(req, res) {
     if (!["PROTECT", "DISABLE", "LOCK", "UNLOCK"].includes(type)) {
       return send(res, 400, { error: "Unsupported command type" });
     }
+    if (type === "PROTECT") {
+      state.devices[deviceId].desiredProtected = true;
+      state.devices[deviceId].lastCommandError = "";
+    }
+    if (type === "DISABLE") {
+      state.devices[deviceId].desiredProtected = false;
+      state.devices[deviceId].lastCommandError = "";
+    }
+    if (type === "LOCK") {
+      state.devices[deviceId].desiredLocked = true;
+      state.devices[deviceId].lastCommandError = "";
+    }
+    if (type === "UNLOCK") {
+      state.devices[deviceId].desiredLocked = false;
+      state.devices[deviceId].lastCommandError = "";
+    }
     return send(res, 201, { command: createCommand(deviceId, type) });
   }
 
@@ -188,6 +232,7 @@ async function route(req, res) {
   ) {
     const deviceId = decodeURIComponent(parts[2]);
     if (!state.commands[deviceId]) state.commands[deviceId] = [];
+    queueDesiredStateCommands(deviceId);
     const commands = state.commands[deviceId].filter(command => command.status === "pending");
     return send(res, 200, { commands });
   }
@@ -214,6 +259,7 @@ async function route(req, res) {
       state.devices[deviceId].lastCommandError = command.error;
       state.devices[deviceId].lastSeenAt = now();
     }
+    queueDesiredStateCommands(deviceId);
     saveState();
     return send(res, 200, { command });
   }
